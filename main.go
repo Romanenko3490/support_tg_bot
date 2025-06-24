@@ -17,7 +17,7 @@ import (
 const (
 	SupportGroupLink = "https://t.me/+d9t6S8-8iy1hOTli"
 	SupportGroupID   = -1002574381342
-	MaxMessagesLimit = 4000 // Лимит сообщений в БД
+	MaxMessagesLimit = 4000
 )
 
 type Ticket struct {
@@ -104,7 +104,6 @@ func initDB() error {
 		status TEXT NOT NULL DEFAULT 'open',
 		thread_id INTEGER DEFAULT 0
 	);
-
 	CREATE TABLE IF NOT EXISTS ticket_messages (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		ticket_id INTEGER NOT NULL,
@@ -116,16 +115,13 @@ func initDB() error {
 		is_support BOOLEAN NOT NULL DEFAULT FALSE,
 		FOREIGN KEY(ticket_id) REFERENCES tickets(id)
 	);
-
 	CREATE INDEX IF NOT EXISTS idx_ticket_messages_ticket_id ON ticket_messages(ticket_id);
 	`)
 	if err != nil {
 		return err
 	}
 
-	// Проверяем количество сообщений и удаляем старые при превышении лимита
 	go checkMessagesLimit()
-
 	return nil
 }
 
@@ -148,8 +144,6 @@ func checkMessagesLimit() {
 			)`, excess)
 		if err != nil {
 			log.Printf("Ошибка удаления старых сообщений: %v", err)
-		} else {
-			log.Printf("Удалено %d старых сообщений для соблюдения лимита", excess)
 		}
 	}
 }
@@ -160,8 +154,6 @@ func verifyGroupAccess() error {
 		return fmt.Errorf("ошибка получения чата: %v", err)
 	}
 
-	log.Printf("Группа: %s (ID: %d)", chat.Title, chat.ID)
-
 	member, err := bot.ChatMemberOf(chat, bot.Me)
 	if err != nil {
 		return fmt.Errorf("ошибка проверки прав: %v", err)
@@ -171,7 +163,6 @@ func verifyGroupAccess() error {
 		return fmt.Errorf("бот не может управлять темами")
 	}
 
-	log.Println("Права бота подтверждены")
 	return nil
 }
 
@@ -179,52 +170,21 @@ func registerHandlers() {
 	bot.Handle("/start", handleStart)
 	bot.Handle("/help", handleHelp)
 	bot.Handle("/mytickets", handleMyTickets)
+	bot.Handle("/history", handleHistoryCommand)
 
-	// Обработчики для кнопок меню
 	bot.Handle(&telebot.Btn{Text: "Новое обращение"}, handleNewTicketButton)
-	bot.Handle(&telebot.Btn{Text: "Закрыть активное обращение"}, handleCloseTicketButton)
-	bot.Handle(&telebot.Btn{Text: "История обращений"}, handleHistoryButton)
+	bot.Handle(&telebot.Btn{Text: "Закрыть обращение"}, handleCloseTicketButton)
+	bot.Handle(&telebot.Btn{Text: "Мои обращения"}, handleMyTicketsButton)
 
-	// Обработчики callback-кнопок
-	bot.Handle(telebot.OnCallback, func(c telebot.Context) error {
-		data := c.Callback().Data
-		switch {
-		case strings.HasPrefix(data, "ticket_"):
-			ticketID, err := strconv.ParseInt(strings.TrimPrefix(data, "ticket_"), 10, 64)
-			if err != nil {
-				return c.Respond()
-			}
-			return handleTicketDetails(c, ticketID)
-		case data == "back_to_menu":
-			return handleBackToMenu(c)
-		case data == "back_to_history":
-			return handleHistoryButton(c)
-		}
-		return nil
-	})
-
-	bot.Handle(telebot.OnText, func(c telebot.Context) error {
-		if strings.HasPrefix(c.Text(), "/") {
-			return nil
-		}
-
-		if c.Chat().Type == telebot.ChatPrivate {
-			return handleUserMessage(c)
-		}
-
-		if c.Chat().ID == SupportGroupID {
-			return handleSupportGroupMessage(c)
-		}
-
-		return nil
-	})
+	bot.Handle(telebot.OnCallback, handleCallbacks)
+	bot.Handle(telebot.OnText, handleTextMessages)
 }
 
 func showUserMenu(c telebot.Context) error {
 	menu := &telebot.ReplyMarkup{}
 	btnNew := menu.Text("Новое обращение")
-	btnClose := menu.Text("Закрыть активное обращение")
-	btnHistory := menu.Text("История обращений")
+	btnClose := menu.Text("Закрыть обращение")
+	btnHistory := menu.Text("Мои обращения")
 
 	menu.Reply(
 		menu.Row(btnNew),
@@ -242,7 +202,6 @@ func handleStart(c telebot.Context) error {
 	if err := c.Send(msg); err != nil {
 		return err
 	}
-
 	return showUserMenu(c)
 }
 
@@ -267,11 +226,11 @@ func handleNewTicketButton(c telebot.Context) error {
 
 	if openTicket != nil {
 		if openTicket.Status == "closed" {
-			return c.Send("Ваше предыдущее обращение уже закрыто. Отправьте сообщение с описанием проблемы для создания нового обращения.")
+			return c.Send("Ваше предыдущее обращение уже закрыто. Отправьте сообщение с описанием проблемы для создания нового.")
 		}
 		return c.Send(fmt.Sprintf(
 			"❌ У вас уже есть активное обращение #%d\n\n"+
-				"Пожалуйста, дождитесь ответа поддержки или закройте текущее обращение перед созданием нового.",
+				"Пожалуйста, дождитесь ответа поддержки или закройте текущее обращение.",
 			openTicket.ID))
 	}
 
@@ -310,9 +269,7 @@ func handleCloseTicketButton(c telebot.Context) error {
 	if _, err := bot.Send(
 		telebot.ChatID(SupportGroupID),
 		text,
-		&telebot.SendOptions{
-			ThreadID: openTicket.ThreadID,
-		},
+		&telebot.SendOptions{ThreadID: openTicket.ThreadID},
 	); err != nil {
 		log.Printf("Ошибка отправки уведомления в группу: %v", err)
 	}
@@ -320,8 +277,20 @@ func handleCloseTicketButton(c telebot.Context) error {
 	return c.Send(fmt.Sprintf("✅ Обращение #%d успешно закрыто.", openTicket.ID))
 }
 
-func handleHistoryButton(c telebot.Context) error {
-	tickets, err := getUserTickets(c.Sender().ID, 10)
+func handleHistoryCommand(c telebot.Context) error {
+	return showTicketHistory(c.Sender().ID, c)
+}
+
+func handleMyTicketsButton(c telebot.Context) error {
+	return handleMyTickets(c)
+}
+
+func handleMyTickets(c telebot.Context) error {
+	return showTicketHistory(c.Sender().ID, c)
+}
+
+func showTicketHistory(userID int64, c telebot.Context) error {
+	tickets, err := getUserTickets(userID, 10)
 	if err != nil {
 		log.Printf("Ошибка получения тикетов: %v", err)
 		return c.Send("❌ Ошибка при получении истории обращений")
@@ -354,19 +323,39 @@ func handleHistoryButton(c telebot.Context) error {
 
 	menu.Inline(rows...)
 
-	msg := "📋 Ваши последние обращения:\n\n" +
-		"Выберите обращение для просмотра деталей:"
-
-	return c.Send(msg, menu)
+	return c.Send("📋 Ваши последние обращения:", menu)
 }
 
-func handleTicketDetails(c telebot.Context, ticketID int64) error {
+func handleCallbacks(c telebot.Context) error {
+	data := c.Callback().Data
+
+	// Удаляем возможные специальные символы в начале
+	data = strings.TrimLeft(data, "\f")
+
+	switch {
+	case strings.HasPrefix(data, "ticket_"):
+		ticketID, err := strconv.ParseInt(strings.TrimPrefix(data, "ticket_"), 10, 64)
+		if err != nil {
+			log.Printf("Ошибка парсинга ID тикета: %v", err)
+			return c.Respond()
+		}
+		return showTicketDetails(c, ticketID)
+	case data == "back_to_menu":
+		return handleBackToMenu(c)
+	case data == "back_to_history":
+		return handleMyTickets(c)
+	}
+	return nil
+}
+
+func showTicketDetails(c telebot.Context, ticketID int64) error {
 	ticket, err := getTicket(ticketID)
 	if err != nil {
 		log.Printf("Ошибка получения тикета: %v", err)
-		return c.Respond()
+		return c.Respond(&telebot.CallbackResponse{Text: "Ошибка при получении данных"})
 	}
 
+	// Проверяем, принадлежит ли тикет пользователю
 	if ticket.UserID != c.Sender().ID {
 		return c.Respond(&telebot.CallbackResponse{Text: "Это не ваше обращение"})
 	}
@@ -374,7 +363,7 @@ func handleTicketDetails(c telebot.Context, ticketID int64) error {
 	history, err := getTicketHistory(ticketID)
 	if err != nil {
 		log.Printf("Ошибка получения истории: %v", err)
-		return c.Respond()
+		return c.Respond(&telebot.CallbackResponse{Text: "Ошибка при получении истории"})
 	}
 
 	var msg strings.Builder
@@ -402,14 +391,15 @@ func handleTicketDetails(c telebot.Context, ticketID int64) error {
 	btnBack := menu.Data("← Назад к списку", "back_to_history")
 	menu.Inline(menu.Row(btnBack))
 
-	_, err = bot.Edit(
-		c.Message(),
+	// Отправляем новое сообщение с историей вместо редактирования
+	_, err = bot.Send(
+		c.Sender(),
 		msg.String(),
 		&telebot.SendOptions{ReplyMarkup: menu},
 	)
 	if err != nil {
-		log.Printf("Ошибка редактирования сообщения: %v", err)
-		return c.Respond()
+		log.Printf("Ошибка отправки истории: %v", err)
+		return c.Respond(&telebot.CallbackResponse{Text: "Ошибка при отправке истории"})
 	}
 
 	return c.Respond()
@@ -419,10 +409,24 @@ func handleBackToMenu(c telebot.Context) error {
 	return showUserMenu(c)
 }
 
+func handleTextMessages(c telebot.Context) error {
+	if strings.HasPrefix(c.Text(), "/") {
+		return nil
+	}
+
+	if c.Chat().Type == telebot.ChatPrivate {
+		return handleUserMessage(c)
+	}
+
+	if c.Chat().ID == SupportGroupID {
+		return handleSupportGroupMessage(c)
+	}
+
+	return nil
+}
+
 func handleUserMessage(c telebot.Context) error {
 	user := c.Sender()
-	log.Printf("Новое сообщение от @%s (%s)", user.Username, user.FirstName)
-
 	openTicket, err := getOpenUserTicket(user.ID)
 	if err != nil && err != sql.ErrNoRows {
 		log.Printf("Ошибка проверки тикетов: %v", err)
@@ -466,7 +470,6 @@ func createNewTicket(c telebot.Context) error {
 			SupportGroupLink))
 	}
 
-	// Сохраняем первое сообщение в историю
 	if err := saveMessageToHistory(ticketID, msg.ID, user.ID, user.Username, msg.Text, false); err != nil {
 		log.Printf("Ошибка сохранения сообщения в историю: %v", err)
 	}
@@ -495,7 +498,6 @@ func forwardToExistingTicket(c telebot.Context, ticket *Ticket) error {
 		return c.Send("❌ Ошибка при обработке сообщения")
 	}
 
-	// Сохраняем сообщение в историю
 	if err := saveMessageToHistory(ticket.ID, msg.ID, user.ID, user.Username, msg.Text, false); err != nil {
 		log.Printf("Ошибка сохранения сообщения в историю: %v", err)
 	}
@@ -516,9 +518,7 @@ func forwardToExistingTicket(c telebot.Context, ticket *Ticket) error {
 	_, err = bot.Send(
 		telebot.ChatID(SupportGroupID),
 		text,
-		&telebot.SendOptions{
-			ThreadID: ticket.ThreadID,
-		},
+		&telebot.SendOptions{ThreadID: ticket.ThreadID},
 	)
 	if err != nil {
 		log.Printf("Ошибка отправки сообщения в тему: %v", err)
@@ -529,15 +529,7 @@ func forwardToExistingTicket(c telebot.Context, ticket *Ticket) error {
 }
 
 func handleSupportGroupMessage(c telebot.Context) error {
-	if c.Chat().ID != SupportGroupID || c.Sender().ID == bot.Me.ID {
-		return nil
-	}
-
-	if c.Message().ThreadID == 0 {
-		return nil
-	}
-
-	if c.Message().IsService() {
+	if c.Chat().ID != SupportGroupID || c.Sender().ID == bot.Me.ID || c.Message().ThreadID == 0 || c.Message().IsService() {
 		return nil
 	}
 
@@ -557,7 +549,6 @@ func handleSupportGroupMessage(c telebot.Context) error {
 		return nil
 	}
 
-	// Сохраняем сообщение поддержки в историю
 	if err := saveMessageToHistory(
 		ticketID,
 		c.Message().ID,
@@ -577,9 +568,7 @@ func handleSupportGroupMessage(c telebot.Context) error {
 
 	if _, err := bot.Send(telebot.ChatID(ticket.UserID), replyText); err != nil {
 		log.Printf("Ошибка отправки ответа: %v", err)
-		return err
 	}
-
 	return nil
 }
 
@@ -613,7 +602,6 @@ func createTicket(t Ticket) (int64, error) {
 }
 
 func sendToSupportGroup(ticketID int64, t Ticket, origMsg *telebot.Message) error {
-	log.Printf("Попытка создания темы для тикета #%d", ticketID)
 	text := fmt.Sprintf(
 		"🚨 Обращение #%d\n\n"+
 			"👤 От: %s %s (@%s)\n"+
@@ -637,7 +625,6 @@ func sendToSupportGroup(ticketID int64, t Ticket, origMsg *telebot.Message) erro
 		log.Printf("Не удалось создать тему: %v", err)
 		return fmt.Errorf("не удалось создать тему: %v", err)
 	}
-	log.Printf("Тема создана успешно, threadID: %d", threadID)
 
 	if threadID != 0 {
 		_, err = db.Exec(
@@ -646,23 +633,14 @@ func sendToSupportGroup(ticketID int64, t Ticket, origMsg *telebot.Message) erro
 		)
 		if err != nil {
 			log.Printf("Ошибка сохранения thread_id: %v", err)
-			return fmt.Errorf("ошибка сохранения thread_id: %v", err)
 		}
 	}
 
-	btnTake := telebot.Btn{
-		Unique: fmt.Sprintf("take_btn_%d", ticketID),
-		Text:   "✅ Принято",
-	}
-	btnClose := telebot.Btn{
-		Unique: fmt.Sprintf("close_btn_%d", ticketID),
-		Text:   "❌ Закрыто",
-	}
+	btnTake := telebot.Btn{Unique: fmt.Sprintf("take_btn_%d", ticketID), Text: "✅ Принято"}
+	btnClose := telebot.Btn{Unique: fmt.Sprintf("close_btn_%d", ticketID), Text: "❌ Закрыто"}
 
 	markup := &telebot.ReplyMarkup{}
-	markup.Inline(
-		markup.Row(btnTake, btnClose),
-	)
+	markup.Inline(markup.Row(btnTake, btnClose))
 
 	bot.Handle(&btnTake, func(c telebot.Context) error {
 		return handleTakeButton(c, ticketID)
@@ -702,24 +680,14 @@ func handleTakeButton(c telebot.Context, ticketID int64) error {
 		log.Printf("Ошибка отправки уведомления пользователю: %v", err)
 	}
 
-	btnClose := telebot.Btn{
-		Unique: fmt.Sprintf("close_btn_%d", ticketID),
-		Text:   "❌ Закрыто",
-	}
-
+	btnClose := telebot.Btn{Unique: fmt.Sprintf("close_btn_%d", ticketID), Text: "❌ Закрыто"}
 	markup := &telebot.ReplyMarkup{}
-	markup.Inline(
-		markup.Row(btnClose),
-	)
-
-	bot.Handle(&btnClose, func(c telebot.Context) error {
-		return handleCloseButton(c, ticketID)
-	})
+	markup.Inline(markup.Row(btnClose))
 
 	editedText := strings.Replace(
 		c.Message().Text,
 		"🔗 Статус: open",
-		"🔗 СтатуС: in_progress",
+		"🔗 Статус: in_progress",
 		1,
 	)
 
@@ -762,10 +730,7 @@ func handleCloseButton(c telebot.Context, ticketID int64) error {
 		1,
 	)
 
-	_, err = bot.Edit(
-		c.Message(),
-		editedText,
-	)
+	_, err = bot.Edit(c.Message(), editedText)
 	if err != nil {
 		log.Printf("Ошибка обновления сообщения: %v", err)
 	}
@@ -774,8 +739,6 @@ func handleCloseButton(c telebot.Context, ticketID int64) error {
 }
 
 func createForumTopic(name string) (int, error) {
-	log.Printf("Создание темы с именем: %s", name)
-
 	params := map[string]interface{}{
 		"chat_id": SupportGroupID,
 		"name":    name,
@@ -785,7 +748,6 @@ func createForumTopic(name string) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("ошибка API: %v", err)
 	}
-	log.Printf("Ответ API: %s", string(resp))
 
 	var result struct {
 		Ok     bool `json:"ok"`
@@ -802,12 +764,7 @@ func createForumTopic(name string) (int, error) {
 		return 0, fmt.Errorf("ошибка Telegram API")
 	}
 
-	log.Printf("Тема создана: %s (ID: %d)", name, result.Result.MessageThreadID)
 	return result.Result.MessageThreadID, nil
-}
-
-func handleMyTickets(c telebot.Context) error {
-	return handleHistoryButton(c)
 }
 
 func getUserTickets(userID int64, limit int) ([]Ticket, error) {
@@ -830,7 +787,6 @@ func getUserTickets(userID int64, limit int) ([]Ticket, error) {
 		}
 		tickets = append(tickets, t)
 	}
-
 	return tickets, nil
 }
 
@@ -889,7 +845,6 @@ func getTicketHistory(ticketID int64) ([]TicketMessage, error) {
 		}
 		history = append(history, m)
 	}
-
 	return history, nil
 }
 
